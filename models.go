@@ -79,17 +79,15 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 			Prompt: autocert.AcceptTOS,
 
 			// Domain
-			HostPolicy: autocert.HostWhitelist(config.SSL.Domain),
+			HostPolicy: autocert.HostWhitelist(config.SSL.Domain, "www."+config.SSL.Domain),
 
 			// Folder to store certificates
 			Cache: autocert.DirCache("certs"),
 			Email: config.SSL.Email,
 		}
 
-		webServer.TLSConfig = &tls.Config{
-			GetCertificate: certManager.GetCertificate,
-			MinVersion:     tls.VersionTLS13,
-		}
+		webServer.TLSConfig = certManager.TLSConfig()
+		webServer.TLSConfig.MinVersion = tls.VersionTLS13
 
 		// Config server to redirect
 		go func() {
