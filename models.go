@@ -121,27 +121,26 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 		}()
 	}
 
-	<-config.terminate
-
-	timeout, cancelFunc := context.WithTimeout(context.Background(), timeOutDuration)
-	defer cancelFunc()
-
 	var outputError error
+	select {
+	case err := <-shutdown:
+		outputError = fmt.Errorf("failed: %w", err)
+	case <-config.terminate:
+		outputError = errors.New("terminated")
 
-	if err := webServer.Shutdown(timeout); err != nil {
-		err := webServer.Close()
-		if err != nil {
-			return err
+		timeout, cancelFunc := context.WithTimeout(context.Background(), timeOutDuration)
+		defer cancelFunc()
+
+		if err := webServer.Shutdown(timeout); err != nil {
+			outputError = fmt.Errorf("unable to terminate: %w", err)
+			err := webServer.Close()
+			if err != nil {
+				outputError = fmt.Errorf("%w: unable to close: %w", outputError, err)
+			}
 		}
-		outputError = fmt.Errorf("unable to terminate the web service: %w", err)
-	}
-	if outputError != nil {
-		return fmt.Errorf("%w: web service terminated: %w", outputError, <-shutdown)
-	} else {
-		outputError = fmt.Errorf("web service terminated: %w", <-shutdown)
-	}
 
-	config.terminated <- struct{}{}
+		config.terminated <- struct{}{}
+	}
 
 	return outputError
 }
