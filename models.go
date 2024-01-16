@@ -91,6 +91,7 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 
 		tlsConfig := certManager.TLSConfig()
 		tlsConfig.MinVersion = tls.VersionTLS13
+		tlsConfig.GetCertificate = certManager.GetCertificate
 
 		// Config server to redirect
 		go func() {
@@ -168,4 +169,13 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 	}
 
 	return outputError
+}
+
+func getCertificates(autoCertManager *autocert.Manager) (string, string) {
+	if autoCertManager == nil {
+		return "certs/cert.pem", "certs/key.pem"
+	}
+
+	return autoCertManager.Cache.Get(context.Background(), "certs/cert.pem"), autoCertManager.Cache.Get("certs/key.pem")
+
 }
