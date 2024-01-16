@@ -106,7 +106,7 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 			)
 		}()
 
-		// HTTPS server to handle the service
+		// HTTP 1.1 and HTTP/2 server to handle the service
 		go func() {
 			http1And2Service.TLSConfig = tlsConfig
 			funcErr := http1And2Service.ListenAndServeTLS("", "")
@@ -115,7 +115,7 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 			}
 		}()
 
-		// HTTP3 server to handle the service
+		// HTTP/3 server to handle the service
 		go func() {
 			streamHijacker := func(frameType http3.FrameType, conn quic.Connection, stream quic.Stream, err error) (bool, error) {
 				// log.Println("stream frame type:", frameType)
