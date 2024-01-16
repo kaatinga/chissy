@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -37,8 +39,8 @@ type SSL struct {
 	Email  string `env:"EMAIL" validate:"email"`
 }
 
-// newWebService creates http.Server structure with router inside.
-func (config *Config) newWebService() http.Server {
+// newHTTP1And2Service creates http.Server structure with router inside.
+func (config *Config) newHTTP1And2Service() http.Server {
 	return http.Server{
 		Addr:              net.JoinHostPort("", fmt.Sprintf("%d", config.Port)),
 		Handler:           chi.NewRouter(),
@@ -61,12 +63,13 @@ func (config *Config) Terminate() {
 // Launch enables the configured web service with the handlers that
 // announced in a function matched with SetUpHandlers type.
 func (config *Config) Launch(handlers SetUpHandlers) error {
-	webServer := config.newWebService()
+	http1And2Service := config.newHTTP1And2Service()
+	var http3Service http3.Server
 
 	// enable handlers inside SetUpHandlers function
-	router, ok := webServer.Handler.(*chi.Mux)
+	router, ok := http1And2Service.Handler.(*chi.Mux)
 	if !ok {
-		return errors.New("webServer.Handler is not a *chi.Router")
+		return errors.New("http1And2Service.Handler is not a *chi.Router")
 	}
 	handlers(router)
 
@@ -86,8 +89,8 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 			Email: config.SSL.Email,
 		}
 
-		webServer.TLSConfig = certManager.TLSConfig()
-		webServer.TLSConfig.MinVersion = tls.VersionTLS13
+		tlsConfig := certManager.TLSConfig()
+		tlsConfig.MinVersion = tls.VersionTLS13
 
 		// Config server to redirect
 		go func() {
@@ -105,14 +108,34 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 
 		// HTTPS server to handle the service
 		go func() {
-			funcErr := webServer.ListenAndServeTLS("", "")
+			http1And2Service.TLSConfig = tlsConfig
+			funcErr := http1And2Service.ListenAndServeTLS("", "")
 			if funcErr != nil {
 				shutdown <- funcErr
 			}
 		}()
+
+		// HTTP3 server to handle the service
+		go func() {
+			streamHijacker := func(frameType http3.FrameType, conn quic.Connection, stream quic.Stream, err error) (bool, error) {
+				// log.Println("stream frame type:", frameType)
+				return false, nil
+			}
+			quicConf := &quic.Config{
+				// MaxIncomingStreams: 1,
+			}
+			http3Service = http3.Server{
+				Handler:        http1And2Service.Handler,
+				QuicConfig:     quicConf,
+				StreamHijacker: streamHijacker,
+				TLSConfig:      tlsConfig,
+			}
+			funcErr := http3Service.ListenAndServeTLS("", "")
+			shutdown <- funcErr
+		}()
 	default:
 		go func() {
-			funcErr := webServer.ListenAndServe()
+			funcErr := http1And2Service.ListenAndServe()
 			if funcErr != nil {
 				shutdown <- funcErr
 			}
@@ -129,12 +152,16 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 		timeout, cancelFunc := context.WithTimeout(context.Background(), timeOutDuration)
 		defer cancelFunc()
 
-		if err := webServer.Shutdown(timeout); err != nil {
-			outputError = fmt.Errorf("unable to terminate: %w", err)
-			err := webServer.Close()
+		if err := http1And2Service.Shutdown(timeout); err != nil {
+			outputError = fmt.Errorf("unable to terminate http1/2 service: %w", err)
+			err := http1And2Service.Close()
 			if err != nil {
-				outputError = fmt.Errorf("%w: unable to close: %w", outputError, err)
+				outputError = fmt.Errorf("%w: unable to close http1/2 service: %w", outputError, err)
 			}
+		}
+
+		if err := http3Service.CloseGracefully(timeOutDuration); err != nil {
+			outputError = fmt.Errorf("unable to terminate http3 service: %w", err)
 		}
 
 		config.terminated <- struct{}{}

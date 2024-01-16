@@ -73,7 +73,7 @@ var (
 
 func TestConfig_newWebService(t *testing.T) {
 	t.Run("valid config", func(t *testing.T) {
-		httpServer := validConfig.newWebService()
+		httpServer := validConfig.newHTTP1And2Service()
 		if !strings.Contains(httpServer.Addr, fmt.Sprintf(":%d", validConfig.Port)) {
 			t.Error("incorrect http port")
 		}
