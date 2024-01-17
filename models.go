@@ -13,9 +13,15 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/sync/errgroup"
 )
 
-var timeOutDuration = 5 * time.Second
+const (
+	timeOutDuration = 5 * time.Second
+	nextProtoH3     = "h3"
+	nextProtoH3_29  = "h3-29"
+	nextProtoH2     = "h2"
+)
 
 // SetUpHandlers type to announce handlers.
 type SetUpHandlers func(r *chi.Mux)
@@ -39,14 +45,28 @@ type SSL struct {
 	Email  string `env:"EMAIL" validate:"email"`
 }
 
-// newHTTP1And2Service creates http.Server structure with router inside.
-func (config *Config) newHTTP1And2Service() http.Server {
-	return http.Server{
+// newHTTP1And2Server creates http.Server.
+func (config *Config) newHTTP1And2Server(router *chi.Mux) *http.Server {
+	return &http.Server{
 		Addr:              net.JoinHostPort("", fmt.Sprintf("%d", config.Port)),
-		Handler:           chi.NewRouter(),
+		Handler:           router,
 		ReadTimeout:       config.ReadTimeout,
 		ReadHeaderTimeout: config.ReadHeaderTimeout,
 		WriteTimeout:      config.WriteTimeout,
+	}
+}
+
+// newHTTP3Server creates http.Server.
+func (config *Config) newHTTP3Server(router *chi.Mux) *http3.Server {
+	return &http3.Server{
+		Handler:    router,
+		QuicConfig: &quic.Config{
+			// MaxIncomingStreams: 1,
+		},
+		StreamHijacker: func(frameType http3.FrameType, conn quic.Connection, stream quic.Stream, err error) (bool, error) {
+			// log.Println("stream frame type:", frameType)
+			return false, nil
+		},
 	}
 }
 
@@ -60,18 +80,15 @@ func (config *Config) Terminate() {
 	<-config.terminated
 }
 
-// Launch enables the configured web service with the handlers that
+// Launch enables the configured web server with the handlers that
 // announced in a function matched with SetUpHandlers type.
-func (config *Config) Launch(handlers SetUpHandlers) error {
-	http1And2Service := config.newHTTP1And2Service()
-	var http3Service http3.Server
+func (config *Config) Launch(setupHandlers SetUpHandlers) error {
+	// enable handlers by setupHandlers() function
+	router := chi.NewRouter()
+	setupHandlers(router)
 
-	// enable handlers inside SetUpHandlers function
-	router, ok := http1And2Service.Handler.(*chi.Mux)
-	if !ok {
-		return errors.New("http1And2Service.Handler is not a *chi.Router")
-	}
-	handlers(router)
+	http1And2Server := config.newHTTP1And2Server(router)
+	http3Server := config.newHTTP3Server(router)
 
 	// shutdown is a special channel to handle errors
 	shutdown := make(chan error)
@@ -92,8 +109,9 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 		tlsConfig := certManager.TLSConfig()
 		tlsConfig.MinVersion = tls.VersionTLS13
 		tlsConfig.GetCertificate = certManager.GetCertificate
+		tlsConfig.NextProtos = []string{nextProtoH3, nextProtoH3_29, nextProtoH2}
 
-		// Config server to redirect
+		// Config HTTP server to redirect from 80 to 443 port
 		go func() {
 			_ = http.ListenAndServe( //nolint:gosec
 				":http",
@@ -109,34 +127,22 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 
 		// HTTP 1.1 and HTTP/2 server to handle the service
 		go func() {
-			http1And2Service.TLSConfig = tlsConfig
-			funcErr := http1And2Service.ListenAndServeTLS("", "")
+			http1And2Server.TLSConfig = tlsConfig
+			funcErr := http1And2Server.ListenAndServeTLS("", "")
 			if funcErr != nil {
 				shutdown <- funcErr
 			}
 		}()
 
-		// HTTP/3 server to handle the service
+		// HTTP/3 server to handle the service on UDP:443
 		go func() {
-			streamHijacker := func(frameType http3.FrameType, conn quic.Connection, stream quic.Stream, err error) (bool, error) {
-				// log.Println("stream frame type:", frameType)
-				return false, nil
-			}
-			quicConf := &quic.Config{
-				// MaxIncomingStreams: 1,
-			}
-			http3Service = http3.Server{
-				Handler:        http1And2Service.Handler,
-				QuicConfig:     quicConf,
-				StreamHijacker: streamHijacker,
-				TLSConfig:      tlsConfig,
-			}
-			funcErr := http3Service.ListenAndServe()
+			http3Server.TLSConfig = tlsConfig
+			funcErr := http3Server.ListenAndServe()
 			shutdown <- funcErr
 		}()
 	default:
 		go func() {
-			funcErr := http1And2Service.ListenAndServe()
+			funcErr := http1And2Server.ListenAndServe()
 			if funcErr != nil {
 				shutdown <- funcErr
 			}
@@ -153,17 +159,38 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 		timeout, cancelFunc := context.WithTimeout(context.Background(), timeOutDuration)
 		defer cancelFunc()
 
-		if err := http1And2Service.Shutdown(timeout); err != nil {
-			outputError = fmt.Errorf("unable to terminate http1/2 service: %w", err)
-			err := http1And2Service.Close()
-			if err != nil {
-				outputError = fmt.Errorf("%w: unable to close http1/2 service: %w", outputError, err)
+		errGroup, egCtx := errgroup.WithContext(timeout)
+		errGroup.Go(func() error {
+			if err := http1And2Server.Shutdown(egCtx); err != nil {
+				err = fmt.Errorf("unable to terminate http1/2 service: %w", err)
+				closeErr := http1And2Server.Close()
+				if closeErr != nil {
+					err = fmt.Errorf("%w: unable to close http1/2 service: %w", err, closeErr)
+				}
+				return err
 			}
+
+			return nil
+		})
+
+		errGroup.Go(func() error {
+			if err := http3Server.CloseGracefully(timeOutDuration); err != nil {
+				err = fmt.Errorf("unable to terminate http3 server: %w", err)
+				closeErr := http3Server.Close()
+				if closeErr != nil {
+					err = fmt.Errorf("%w: unable to close http3 service: %w", err, closeErr)
+				}
+				return err
+			}
+
+			return nil
+		})
+
+		if err := errGroup.Wait(); err != nil {
+			outputError = fmt.Errorf("unable to terminate the web services: %w", err)
 		}
 
-		if err := http3Service.CloseGracefully(timeOutDuration); err != nil {
-			outputError = fmt.Errorf("unable to terminate http3 service: %w", err)
-		}
+		cancelFunc()
 
 		config.terminated <- struct{}{}
 	}
