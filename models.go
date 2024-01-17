@@ -131,7 +131,7 @@ func (config *Config) Launch(handlers SetUpHandlers) error {
 				StreamHijacker: streamHijacker,
 				TLSConfig:      tlsConfig,
 			}
-			funcErr := http3Service.ListenAndServeTLS("", "")
+			funcErr := http3Service.ListenAndServe()
 			shutdown <- funcErr
 		}()
 	default:
