@@ -60,7 +60,7 @@ func (config *Config) newHTTP1And2Server(router *chi.Mux) *http.Server {
 // newHTTP3Server creates http.Server.
 func (config *Config) newHTTP3Server(router *chi.Mux) *http3.Server {
 	return &http3.Server{
-		Handler: router,
+		Handler:    router,
 		QuicConfig: &quic.Config{
 			// MaxIncomingStreams: 1,
 		},
