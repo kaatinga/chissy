@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -41,8 +42,8 @@ type Config struct {
 }
 
 type SSL struct {
-	Domain string `env:"DOMAIN" validate:"fqdn"`
-	Email  string `env:"EMAIL" validate:"email"`
+	Domains string `env:"DOMAIN" validate:"required"`
+	Email   string `env:"EMAIL" validate:"email"`
 }
 
 // newHTTP1And2Server creates http.Server.
@@ -59,7 +60,7 @@ func (config *Config) newHTTP1And2Server(router *chi.Mux) *http.Server {
 // newHTTP3Server creates http.Server.
 func (config *Config) newHTTP3Server(router *chi.Mux) *http3.Server {
 	return &http3.Server{
-		Handler:    router,
+		Handler: router,
 		QuicConfig: &quic.Config{
 			// MaxIncomingStreams: 1,
 		},
@@ -95,11 +96,17 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 
 	switch config.ProductionMode {
 	case true:
+		domains := strings.Split(config.SSL.Domains, ",")
+		domainsWithWWW := make([]string, len(domains)*2)
+		for i, domain := range domains {
+			domainsWithWWW[i*2] = domain
+			domainsWithWWW[i*2+1] = "www." + domain
+		}
 		certManager := autocert.Manager{
 			Prompt: autocert.AcceptTOS,
 
-			// Domain
-			HostPolicy: autocert.HostWhitelist(config.SSL.Domain, "www."+config.SSL.Domain),
+			// Domain,
+			HostPolicy: autocert.HostWhitelist(domainsWithWWW...),
 
 			// Folder to store certificates
 			Cache: autocert.DirCache("certs"),
@@ -115,13 +122,7 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 		go func() {
 			_ = http.ListenAndServe( //nolint:gosec
 				":http",
-				certManager.HTTPHandler(
-
-					// Redirect from http to https
-					http.RedirectHandler(
-						"https://"+config.SSL.Domain,
-						http.StatusPermanentRedirect),
-				),
+				certManager.HTTPHandler(RedirectToHTTPS()),
 			)
 		}()
 
@@ -196,4 +197,13 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 	}
 
 	return outputError
+}
+
+func RedirectToHTTPS() http.Handler {
+	fn := func(w http.ResponseWriter, r *http.Request) {
+		// redirect to https
+		http.Redirect(w, r, "https://"+r.Host+r.RequestURI, http.StatusPermanentRedirect)
+	}
+
+	return http.HandlerFunc(fn)
 }

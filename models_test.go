@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-chi/chi/v5"
 )
 
 var (
@@ -73,7 +75,8 @@ var (
 
 func TestConfig_newWebService(t *testing.T) {
 	t.Run("valid config", func(t *testing.T) {
-		httpServer := validConfig.newHTTP1And2Service()
+		router := chi.NewRouter()
+		httpServer := validConfig.newHTTP1And2Server(router)
 		if !strings.Contains(httpServer.Addr, fmt.Sprintf(":%d", validConfig.Port)) {
 			t.Error("incorrect http port")
 		}
