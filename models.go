@@ -84,7 +84,6 @@ func (config *Config) Terminate() {
 // Launch enables the configured web server with the handlers that
 // announced in a function matched with SetUpHandlers type.
 func (config *Config) Launch(setupHandlers SetUpHandlers) error {
-	// enable handlers by setupHandlers() function
 	router := chi.NewRouter()
 	setupHandlers(router)
 
@@ -99,6 +98,7 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 		domains := strings.Split(config.SSL.Domains, ",")
 		domainsWithWWW := make([]string, len(domains)*2)
 		for i, domain := range domains {
+			domains[i] = strings.TrimSpace(domain)
 			domainsWithWWW[i*2] = domain
 			domainsWithWWW[i*2+1] = "www." + domain
 		}
