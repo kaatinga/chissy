@@ -42,7 +42,7 @@ type Config struct {
 }
 
 type SSL struct {
-	Domains string `env:"DOMAIN" validate:"required"`
+	Domains string `env:"DOMAINS" validate:"required"`
 	Email   string `env:"EMAIL" validate:"email"`
 }
 
