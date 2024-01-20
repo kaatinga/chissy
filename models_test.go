@@ -2,6 +2,7 @@ package chissy
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -93,4 +94,21 @@ func TestConfig_newWebService(t *testing.T) {
 			t.Error("invalid read header timeout")
 		}
 	})
+}
+
+func TestConfig_getDomainsWithWWW(t *testing.T) {
+	tests := []struct {
+		config Config
+		want   []string
+	}{
+		{config: Config{SSL: SSL{Domains: "yandex.ru"}}, want: []string{"yandex.ru", "www.yandex.ru"}},
+		{config: Config{SSL: SSL{Domains: "yandex.ru,google.com"}}, want: []string{"yandex.ru", "www.yandex.ru", "google.com", "www.google.com"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.config.SSL.Domains, func(t *testing.T) {
+			if _, got := tt.config.getDomainsWithWWW(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("getDomainsWithWWW() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

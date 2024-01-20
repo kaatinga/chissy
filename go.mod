@@ -6,6 +6,7 @@ require (
 	github.com/go-chi/chi/v5 v5.0.11
 	github.com/quic-go/quic-go v0.40.1
 	golang.org/x/crypto v0.18.0
+	golang.org/x/sync v0.2.0
 )
 
 require (

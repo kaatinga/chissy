@@ -95,18 +95,12 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 
 	switch config.ProductionMode {
 	case true:
-		domains := strings.Split(config.SSL.Domains, ",")
-		domainsWithWWW := make([]string, len(domains)*2)
-		for i, domain := range domains {
-			domains[i] = strings.TrimSpace(domain)
-			domainsWithWWW[i*2] = domain
-			domainsWithWWW[i*2+1] = "www." + domain
-		}
+		baseDomains, domains := config.getDomainsWithWWW()
 		certManager := autocert.Manager{
 			Prompt: autocert.AcceptTOS,
 
 			// Domain,
-			HostPolicy: autocert.HostWhitelist(domainsWithWWW...),
+			HostPolicy: autocert.HostWhitelist(domains...),
 
 			// Folder to store certificates
 			Cache: autocert.DirCache("certs"),
@@ -122,7 +116,7 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 		go func() {
 			_ = http.ListenAndServe( //nolint:gosec
 				":http",
-				certManager.HTTPHandler(RedirectToHTTPS()),
+				certManager.HTTPHandler(RedirectToHTTPS(baseDomains)),
 			)
 		}()
 
@@ -199,10 +193,27 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 	return outputError
 }
 
-func RedirectToHTTPS() http.Handler {
+func (config *Config) getDomainsWithWWW() ([]string, []string) {
+	domains := strings.Split(config.SSL.Domains, ",")
+	domainsWithWWW := make([]string, len(domains)*2)
+	for i, domain := range domains {
+		domains[i] = strings.TrimSpace(domain)
+		domainsWithWWW[i*2] = domain
+		domainsWithWWW[i*2+1] = "www." + domain
+	}
+	return domains, domainsWithWWW
+}
+
+func RedirectToHTTPS(domains []string) http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
 		// redirect to https
-		http.Redirect(w, r, "https://"+r.Host+r.RequestURI, http.StatusPermanentRedirect)
+		var domainToRedirect string
+		for _, domain := range domains {
+			if strings.Contains(r.Host, domain) {
+				domainToRedirect = domain
+			}
+		}
+		http.Redirect(w, r, "https://"+domainToRedirect+r.RequestURI, http.StatusPermanentRedirect)
 	}
 
 	return http.HandlerFunc(fn)
