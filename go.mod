@@ -4,9 +4,9 @@ go 1.21
 
 require (
 	github.com/go-chi/chi/v5 v5.0.11
-	github.com/quic-go/quic-go v0.40.1
+	github.com/quic-go/quic-go v0.41.0
 	golang.org/x/crypto v0.18.0
-	golang.org/x/sync v0.2.0
+	golang.org/x/sync v0.6.0
 )
 
 require (
@@ -14,7 +14,6 @@ require (
 	github.com/google/pprof v0.0.0-20210407192527-94a9f03dee38 // indirect
 	github.com/onsi/ginkgo/v2 v2.9.5 // indirect
 	github.com/quic-go/qpack v0.4.0 // indirect
-	github.com/quic-go/qtls-go1-20 v0.4.1 // indirect
 	go.uber.org/mock v0.3.0 // indirect
 	golang.org/x/exp v0.0.0-20221205204356-47842c84f3db // indirect
 	golang.org/x/mod v0.11.0 // indirect

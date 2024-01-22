@@ -106,8 +106,8 @@ func TestConfig_getDomainsWithWWW(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.config.SSL.Domains, func(t *testing.T) {
-			if _, got := tt.config.getDomainsWithWWW(); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("getDomainsWithWWW() = %v, want %v", got, tt.want)
+			if got := tt.config.parseDomains(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseDomains() = %v, want %v", got, tt.want)
 			}
 		})
 	}

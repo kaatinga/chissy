@@ -42,23 +42,24 @@ type Config struct {
 }
 
 type SSL struct {
-	Domains string `env:"DOMAINS" validate:"required"`
-	Email   string `env:"EMAIL" validate:"email"`
+	Domains    string `env:"DOMAINS" validate:"required"`
+	Email      string `env:"EMAIL" validate:"email"`
+	DomainList []string
 }
 
 // newHTTP1And2Server creates http.Server.
-func (config *Config) newHTTP1And2Server(router *chi.Mux) *http.Server {
+func (c *Config) newHTTP1And2Server(router *chi.Mux) *http.Server {
 	return &http.Server{
-		Addr:              net.JoinHostPort("", fmt.Sprintf("%d", config.Port)),
+		Addr:              net.JoinHostPort("", fmt.Sprintf("%d", c.Port)),
 		Handler:           router,
-		ReadTimeout:       config.ReadTimeout,
-		ReadHeaderTimeout: config.ReadHeaderTimeout,
-		WriteTimeout:      config.WriteTimeout,
+		ReadTimeout:       c.ReadTimeout,
+		ReadHeaderTimeout: c.ReadHeaderTimeout,
+		WriteTimeout:      c.WriteTimeout,
 	}
 }
 
 // newHTTP3Server creates http.Server.
-func (config *Config) newHTTP3Server(router *chi.Mux) *http3.Server {
+func (c *Config) newHTTP3Server(router *chi.Mux) *http3.Server {
 	return &http3.Server{
 		Handler:    router,
 		QuicConfig: &quic.Config{
@@ -71,31 +72,31 @@ func (config *Config) newHTTP3Server(router *chi.Mux) *http3.Server {
 	}
 }
 
-func (config *Config) Init() {
-	config.terminate = make(chan struct{})
-	config.terminated = make(chan struct{})
+func (c *Config) Init() {
+	c.terminate = make(chan struct{})
+	c.terminated = make(chan struct{})
 }
 
-func (config *Config) Terminate() {
-	config.terminate <- struct{}{}
-	<-config.terminated
+func (c *Config) Terminate() {
+	c.terminate <- struct{}{}
+	<-c.terminated
 }
 
 // Launch enables the configured web server with the handlers that
 // announced in a function matched with SetUpHandlers type.
-func (config *Config) Launch(setupHandlers SetUpHandlers) error {
+func (c *Config) Launch(setupHandlers SetUpHandlers) error {
 	router := chi.NewRouter()
 	setupHandlers(router)
 
-	http1And2Server := config.newHTTP1And2Server(router)
-	http3Server := config.newHTTP3Server(router)
+	http1And2Server := c.newHTTP1And2Server(router)
+	http3Server := c.newHTTP3Server(router)
 
 	// shutdown is a special channel to handle errors
 	shutdown := make(chan error)
 
-	switch config.ProductionMode {
+	switch c.ProductionMode {
 	case true:
-		baseDomains, domains := config.getDomainsWithWWW()
+		domains := c.parseDomains()
 		certManager := autocert.Manager{
 			Prompt: autocert.AcceptTOS,
 
@@ -104,7 +105,7 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 
 			// Folder to store certificates
 			Cache: autocert.DirCache("certs"),
-			Email: config.SSL.Email,
+			Email: c.SSL.Email,
 		}
 
 		tlsConfig := certManager.TLSConfig()
@@ -116,7 +117,7 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 		go func() {
 			_ = http.ListenAndServe( //nolint:gosec
 				":http",
-				certManager.HTTPHandler(RedirectToHTTPS(baseDomains)),
+				certManager.HTTPHandler(RedirectToHTTPS(c.SSL.DomainList)),
 			)
 		}()
 
@@ -148,7 +149,7 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 	select {
 	case err := <-shutdown:
 		outputError = fmt.Errorf("failed: %w", err)
-	case <-config.terminate:
+	case <-c.terminate:
 		outputError = errors.New("terminated")
 
 		timeout, cancelFunc := context.WithTimeout(context.Background(), timeOutDuration)
@@ -187,21 +188,21 @@ func (config *Config) Launch(setupHandlers SetUpHandlers) error {
 
 		cancelFunc()
 
-		config.terminated <- struct{}{}
+		c.terminated <- struct{}{}
 	}
 
 	return outputError
 }
 
-func (config *Config) getDomainsWithWWW() ([]string, []string) {
-	domains := strings.Split(config.SSL.Domains, ",")
-	domainsWithWWW := make([]string, len(domains)*2)
-	for i, domain := range domains {
-		domains[i] = strings.TrimSpace(domain)
-		domainsWithWWW[i*2] = domain
-		domainsWithWWW[i*2+1] = "www." + domain
+func (c *Config) parseDomains() []string {
+	c.SSL.DomainList = strings.Split(c.SSL.Domains, ",")
+	domainsWithWWW := make([]string, len(c.SSL.DomainList)*2)
+	for i := range c.SSL.DomainList {
+		c.SSL.DomainList[i] = strings.TrimSpace(c.SSL.DomainList[i])
+		domainsWithWWW[i*2] = c.SSL.DomainList[i]
+		domainsWithWWW[i*2+1] = "www." + c.SSL.DomainList[i]
 	}
-	return domains, domainsWithWWW
+	return domainsWithWWW
 }
 
 func RedirectToHTTPS(domains []string) http.Handler {
