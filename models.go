@@ -62,7 +62,7 @@ func (c *Config) newHTTP1And2Server(router *chi.Mux) *http.Server {
 // newHTTP3Server creates http.Server.
 func (c *Config) newHTTP3Server(router *chi.Mux) *http3.Server {
 	return &http3.Server{
-		Handler:    router,
+		Handler: router,
 		QuicConfig: &quic.Config{
 			// MaxIncomingStreams: 1,
 		},
@@ -86,6 +86,7 @@ func (c *Config) Terminate() {
 // Launch enables the configured web server with the handlers that
 // announced in a function matched with SetUpHandlers type.
 func (c *Config) Launch(setupHandlers SetUpHandlers) error {
+	domains := c.parseDomains()
 	router := chi.NewRouter()
 	setupHandlers(router)
 
@@ -96,9 +97,6 @@ func (c *Config) Launch(setupHandlers SetUpHandlers) error {
 	shutdown := make(chan error)
 
 	if c.ProductionMode {
-		domains := c.parseDomains()
-		fmt.Println(domains)
-		fmt.Println(c.SSL.DomainList)
 		certManager := autocert.Manager{
 			Prompt: autocert.AcceptTOS,
 
