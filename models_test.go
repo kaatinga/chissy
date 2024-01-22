@@ -98,16 +98,22 @@ func TestConfig_newWebService(t *testing.T) {
 
 func TestConfig_getDomainsWithWWW(t *testing.T) {
 	tests := []struct {
-		config Config
-		want   []string
+		config         Config
+		wantWithWWW    []string
+		wantWithoutWWW []string
 	}{
-		{config: Config{SSL: SSL{Domains: "yandex.ru"}}, want: []string{"yandex.ru", "www.yandex.ru"}},
-		{config: Config{SSL: SSL{Domains: "yandex.ru,google.com"}}, want: []string{"yandex.ru", "www.yandex.ru", "google.com", "www.google.com"}},
+		{config: Config{SSL: SSL{Domains: "yandex.ru"}}, wantWithWWW: []string{"yandex.ru", "www.yandex.ru"}, wantWithoutWWW: []string{"yandex.ru"}},
+		{config: Config{SSL: SSL{Domains: "yandex.ru,google.com"}}, wantWithWWW: []string{"yandex.ru", "www.yandex.ru", "google.com", "www.google.com"}, wantWithoutWWW: []string{"yandex.ru", "google.com"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.config.SSL.Domains, func(t *testing.T) {
-			if got := tt.config.parseDomains(); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("parseDomains() = %v, want %v", got, tt.want)
+			got := tt.config.parseDomains()
+			if !reflect.DeepEqual(got, tt.wantWithWWW) {
+				t.Errorf("parseDomains() = %v, want %v", got, tt.wantWithWWW)
+			}
+
+			if !reflect.DeepEqual(tt.config.SSL.DomainList, tt.wantWithoutWWW) {
+				t.Errorf("parseDomains() = %v, want %v", tt.config.SSL.DomainList, tt.wantWithoutWWW)
 			}
 		})
 	}

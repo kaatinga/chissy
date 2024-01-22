@@ -95,9 +95,10 @@ func (c *Config) Launch(setupHandlers SetUpHandlers) error {
 	// shutdown is a special channel to handle errors
 	shutdown := make(chan error)
 
-	switch c.ProductionMode {
-	case true:
+	if c.ProductionMode {
 		domains := c.parseDomains()
+		fmt.Println(domains)
+		fmt.Println(c.SSL.DomainList)
 		certManager := autocert.Manager{
 			Prompt: autocert.AcceptTOS,
 
@@ -137,7 +138,7 @@ func (c *Config) Launch(setupHandlers SetUpHandlers) error {
 			funcErr := http3Server.ListenAndServe()
 			shutdown <- funcErr
 		}()
-	default:
+	} else {
 		go func() {
 			funcErr := http1And2Server.ListenAndServe()
 			if funcErr != nil {
