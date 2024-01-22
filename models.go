@@ -31,6 +31,7 @@ type SetUpHandlers func(r *chi.Mux)
 // https://github.com/kaatinga/settings
 type Config struct {
 	ProductionMode    bool          `env:"PROD"`
+	LocalhostDomain   string        `env:"LOCALHOST_DOMAIN" validate:"required_if=ProductionMode false"`
 	SSL               SSL           `validate:"required_if=ProductionMode true"`
 	Port              uint16        `env:"PORT" validate:"min=80,max=65535"`
 	ReadTimeout       time.Duration `env:"READ_TIMEOUT" default:"1m"`
