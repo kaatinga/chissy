@@ -22,6 +22,7 @@ const (
 	nextProtoH3     = "h3"
 	nextProtoH3_29  = "h3-29"
 	nextProtoH2     = "h2"
+	nextProtoH1     = "http/1.1"
 )
 
 // SetUpHandlers type to announce handlers.
@@ -111,7 +112,7 @@ func (c *Config) Launch(setupHandlers SetUpHandlers) error {
 		tlsConfig := certManager.TLSConfig()
 		tlsConfig.MinVersion = tls.VersionTLS13
 		tlsConfig.GetCertificate = certManager.GetCertificate
-		tlsConfig.NextProtos = []string{nextProtoH3, nextProtoH3_29, nextProtoH2}
+		tlsConfig.NextProtos = []string{nextProtoH3, nextProtoH3_29, nextProtoH2, nextProtoH1}
 
 		// Config HTTP server to redirect from 80 to 443 port
 		go func() {
