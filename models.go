@@ -84,10 +84,20 @@ func (c *Config) Terminate() {
 	<-c.terminated
 }
 
+type ExtraFunc func() error
+
 // Launch enables the configured web server with the handlers that
 // announced in a function matched with SetUpHandlers type.
-func (c *Config) Launch(setupHandlers SetUpHandlers) error {
+func (c *Config) Launch(setupHandlers SetUpHandlers, extrafuncs ...ExtraFunc) error {
 	domains := c.parseDomains()
+
+	// Extra func dependent on the list of domains
+	for _, f := range extrafuncs {
+		if err := f(); err != nil {
+			return fmt.Errorf("unable to execute extra function: %w", err)
+		}
+	}
+
 	router := chi.NewRouter()
 	setupHandlers(router)
 
