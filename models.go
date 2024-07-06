@@ -64,13 +64,13 @@ func (c *Config) newHTTP1And2Server(router *chi.Mux) *http.Server {
 func (c *Config) newHTTP3Server(router *chi.Mux) *http3.Server {
 	return &http3.Server{
 		Handler:    router,
-		QuicConfig: &quic.Config{
+		QUICConfig: &quic.Config{
 			// MaxIncomingStreams: 1,
 		},
-		StreamHijacker: func(frameType http3.FrameType, conn quic.Connection, stream quic.Stream, err error) (bool, error) {
-			// log.Println("stream frame type:", frameType)
-			return false, nil
-		},
+		// StreamHijacker: func(frameType http3.FrameType, conn quic.ConnectionTracingID, stream quic.Stream, err error) (bool, error) {
+		// 	// log.Println("stream frame type:", frameType)
+		// 	return false, nil
+		// },
 	}
 }
 
