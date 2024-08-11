@@ -22,7 +22,6 @@ const (
 	nextProtoH3     = "h3"
 	nextProtoH3_29  = "h3-29"
 	nextProtoH2     = "h2"
-	nextProtoH1     = "http/1.1"
 )
 
 // SetUpHandlers type to announce handlers.
@@ -99,6 +98,10 @@ func (c *Config) Launch(setupHandlers SetUpHandlers, extrafuncs ...ExtraFunc) er
 	}
 
 	router := chi.NewRouter()
+	if c.ProductionMode {
+		router.Use(advertiseHTTP3)
+		router.Use(advertiseHSTS)
+	}
 	setupHandlers(router)
 
 	http1And2Server := c.newHTTP1And2Server(router)
@@ -109,20 +112,21 @@ func (c *Config) Launch(setupHandlers SetUpHandlers, extrafuncs ...ExtraFunc) er
 
 	if c.ProductionMode {
 		certManager := autocert.Manager{
-			Prompt: autocert.AcceptTOS,
-
-			// Domain,
+			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(domains...),
-
-			// Folder to store certificates
-			Cache: autocert.DirCache("certs"),
-			Email: c.SSL.Email,
+			Cache:      autocert.DirCache("certs"),
+			Email:      c.SSL.Email,
 		}
 
-		tlsConfig := certManager.TLSConfig()
-		tlsConfig.MinVersion = tls.VersionTLS13
-		tlsConfig.GetCertificate = certManager.GetCertificate
-		tlsConfig.NextProtos = []string{nextProtoH3, nextProtoH3_29, nextProtoH2, nextProtoH1}
+		tlsConfig1and2 := certManager.TLSConfig()
+		tlsConfig1and2.MinVersion = tls.VersionTLS13
+		tlsConfig1and2.GetCertificate = certManager.GetCertificate
+		tlsConfig1and2.NextProtos = []string{nextProtoH2}
+
+		tlsConfig3 := certManager.TLSConfig()
+		tlsConfig3.MinVersion = tls.VersionTLS13
+		tlsConfig3.GetCertificate = certManager.GetCertificate
+		tlsConfig3.NextProtos = []string{nextProtoH3, nextProtoH3_29}
 
 		// Config HTTP server to redirect from 80 to 443 port
 		go func() {
@@ -134,24 +138,23 @@ func (c *Config) Launch(setupHandlers SetUpHandlers, extrafuncs ...ExtraFunc) er
 
 		// HTTP 1.1 and HTTP/2 server to handle the service
 		go func() {
-			http1And2Server.TLSConfig = tlsConfig
-			funcErr := http1And2Server.ListenAndServeTLS("", "")
-			if funcErr != nil {
-				shutdown <- funcErr
+			http1And2Server.TLSConfig = tlsConfig1and2
+			if err := http1And2Server.ListenAndServeTLS("", ""); err != nil {
+				shutdown <- err
 			}
 		}()
 
 		// HTTP/3 server to handle the service on UDP:443
 		go func() {
-			http3Server.TLSConfig = tlsConfig
-			funcErr := http3Server.ListenAndServe()
-			shutdown <- funcErr
+			http3Server.TLSConfig = tlsConfig3
+			if err := http3Server.ListenAndServe(); err != nil {
+				shutdown <- err
+			}
 		}()
 	} else {
 		go func() {
-			funcErr := http1And2Server.ListenAndServe()
-			if funcErr != nil {
-				shutdown <- funcErr
+			if err := http1And2Server.ListenAndServe(); err != nil {
+				shutdown <- err
 			}
 		}()
 	}
@@ -168,36 +171,31 @@ func (c *Config) Launch(setupHandlers SetUpHandlers, extrafuncs ...ExtraFunc) er
 
 		errGroup, egCtx := errgroup.WithContext(timeout)
 		errGroup.Go(func() error {
-			if err := http1And2Server.Shutdown(egCtx); err != nil {
+			err := http1And2Server.Shutdown(egCtx)
+			if err != nil {
 				err = fmt.Errorf("unable to terminate http1/2 service: %w", err)
-				closeErr := http1And2Server.Close()
-				if closeErr != nil {
+				if closeErr := http1And2Server.Close(); closeErr != nil {
 					err = fmt.Errorf("%w: unable to close http1/2 service: %w", err, closeErr)
 				}
-				return err
 			}
-
-			return nil
+			return err
 		})
 
 		errGroup.Go(func() error {
-			if err := http3Server.CloseGracefully(timeOutDuration); err != nil {
+			err := http3Server.CloseGracefully(timeOutDuration)
+			if err != nil {
 				err = fmt.Errorf("unable to terminate http3 server: %w", err)
 				closeErr := http3Server.Close()
 				if closeErr != nil {
 					err = fmt.Errorf("%w: unable to close http3 service: %w", err, closeErr)
 				}
-				return err
 			}
-
-			return nil
+			return err
 		})
 
 		if err := errGroup.Wait(); err != nil {
 			outputError = fmt.Errorf("unable to terminate the web services: %w", err)
 		}
-
-		cancelFunc()
 
 		c.terminated <- struct{}{}
 	}
