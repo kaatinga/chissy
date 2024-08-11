@@ -1,4 +1,4 @@
-module github.com/kaatinga/chissy
+module github.com/kaatinga/chissy/v2
 
 go 1.21
 
