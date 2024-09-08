@@ -43,7 +43,6 @@ type Config struct {
 }
 
 type SSL struct {
-	Domains    string `env:"DOMAINS" validate:"required"`
 	Email      string `env:"EMAIL" validate:"email"`
 	DomainList []string
 }
@@ -83,19 +82,10 @@ func (c *Config) Terminate() {
 	<-c.terminated
 }
 
-type ExtraFunc func() error
-
 // Launch enables the configured web server with the handlers that
 // announced in a function matched with SetUpHandlers type.
-func (c *Config) Launch(setupHandlers SetUpHandlers, extrafuncs ...ExtraFunc) error {
-	domains := c.parseDomains()
-
-	// Extra func dependent on the list of domains
-	for _, f := range extrafuncs {
-		if err := f(); err != nil {
-			return fmt.Errorf("unable to execute extra function: %w", err)
-		}
-	}
+func (c *Config) Launch(setupHandlers SetUpHandlers) error {
+	domainsPlusWWWDomains := c.getDomainsPlusWWWDomains()
 
 	router := chi.NewRouter()
 	if c.ProductionMode {
@@ -113,7 +103,7 @@ func (c *Config) Launch(setupHandlers SetUpHandlers, extrafuncs ...ExtraFunc) er
 	if c.ProductionMode {
 		certManager := autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(domains...),
+			HostPolicy: autocert.HostWhitelist(domainsPlusWWWDomains...),
 			Cache:      autocert.DirCache("certs"),
 			Email:      c.SSL.Email,
 		}
@@ -203,14 +193,14 @@ func (c *Config) Launch(setupHandlers SetUpHandlers, extrafuncs ...ExtraFunc) er
 	return outputError
 }
 
-func (c *Config) parseDomains() []string {
-	c.SSL.DomainList = strings.Split(c.SSL.Domains, ",")
-	domainsWithWWW := make([]string, len(c.SSL.DomainList)*2)
+func (c *Config) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
+	domainsWithWWW = make([]string, len(c.SSL.DomainList)*2)
 	for i := range c.SSL.DomainList {
 		c.SSL.DomainList[i] = strings.TrimSpace(c.SSL.DomainList[i])
 		domainsWithWWW[i*2] = c.SSL.DomainList[i]
 		domainsWithWWW[i*2+1] = "www." + c.SSL.DomainList[i]
 	}
+
 	return domainsWithWWW
 }
 
