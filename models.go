@@ -172,7 +172,7 @@ func (c *Config) Launch(setupHandlers SetUpHandlers) error {
 		})
 
 		errGroup.Go(func() error {
-			err := http3Server.CloseGracefully(timeOutDuration)
+			err := http3Server.Shutdown(timeout)
 			if err != nil {
 				err = fmt.Errorf("unable to terminate http3 server: %w", err)
 				closeErr := http3Server.Close()
