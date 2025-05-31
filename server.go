@@ -59,7 +59,7 @@ type Server struct {
 
 // Launch enables the configured web server with the handlers that
 // announced in a function matched with SetUpHandlers type.
-func (c *Server) Launch(ctx context.Context, setupHandlers SetUpHandlers) error {
+func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 	domainsPlusWWWDomains := c.getDomainsPlusWWWDomains()
 
 	router := chi.NewRouter()
@@ -130,8 +130,8 @@ func (c *Server) Launch(ctx context.Context, setupHandlers SetUpHandlers) error 
 	select {
 	case err := <-serverErrors:
 		shutdownErr = err
-	case <-ctx.Done():
-		shutdownErr = ctx.Err()
+	case <-c.ctx.Done():
+		shutdownErr = c.ctx.Err()
 	}
 
 	// Create a timeout context for shutdown
