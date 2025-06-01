@@ -50,12 +50,12 @@ type SSL struct {
 
 // ServerOption defines a function that configures a server instance.
 // It follows the functional options pattern for flexible server configuration.
-type ServerOption func(*httpServer)
+type ServerOption func(*Server)
 
 // WithMetricsServer enables Prometheus metrics server on the specified port.
 // This allows monitoring of server metrics through the /metrics endpoint.
 func WithMetricsServer(port uint16) ServerOption {
-	return func(s *httpServer) {
+	return func(s *Server) {
 		s.metricsEnabled = true
 		s.metricsPort = port
 	}
@@ -64,15 +64,15 @@ func WithMetricsServer(port uint16) ServerOption {
 // WithHTTP3 enables HTTP/3 support for the server.
 // HTTP/3 provides improved performance and reliability over HTTP/2.
 func WithHTTP3() ServerOption {
-	return func(s *httpServer) {
+	return func(s *Server) {
 		s.http3Enabled = true
 	}
 }
 
 // NewServer creates a new HTTP server instance with the given configuration and options.
 // It initializes the server with default settings and applies any provided options.
-func NewServer(ctx context.Context, config Config, opts ...ServerOption) *httpServer {
-	s := &httpServer{
+func NewServer(ctx context.Context, config Config, opts ...ServerOption) *Server {
+	s := &Server{
 		ctx:    ctx,
 		config: config,
 	}
@@ -82,7 +82,7 @@ func NewServer(ctx context.Context, config Config, opts ...ServerOption) *httpSe
 	return s
 }
 
-type httpServer struct {
+type Server struct {
 	http1And2Server *http.Server
 	http3Server     *http3.Server
 	metricsServer   *http.Server
@@ -97,7 +97,7 @@ type httpServer struct {
 // It supports both HTTP/1.1, HTTP/2, and optionally HTTP/3 protocols.
 // In production mode, it also sets up SSL/TLS with automatic certificate management.
 // Returns an error if the server fails to start or encounters a fatal error.
-func (c *httpServer) Launch(setupHandlers SetUpHandlers) error {
+func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 	domainsPlusWWWDomains := c.getDomainsPlusWWWDomains()
 
 	router := chi.NewRouter()
@@ -262,7 +262,7 @@ func (c *httpServer) Launch(setupHandlers SetUpHandlers) error {
 
 // getDomainsPlusWWWDomains generates a list of domains including their www subdomains
 // for SSL certificate management. This ensures both apex and www domains are covered.
-func (c *httpServer) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
+func (c *Server) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
 	domainsWithWWW = make([]string, len(c.config.SSL.DomainList)*2)
 	for i := range c.config.SSL.DomainList {
 		c.config.SSL.DomainList[i] = strings.TrimSpace(c.config.SSL.DomainList[i])
@@ -275,7 +275,7 @@ func (c *httpServer) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
 
 // redirectToHTTPS creates an HTTP handler that redirects all HTTP traffic to HTTPS.
 // It preserves the original request path and query parameters during redirection.
-func (c *httpServer) redirectToHTTPS() http.Handler {
+func (c *Server) redirectToHTTPS() http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
 		// redirect to https
 		var domainToRedirect string
@@ -292,7 +292,7 @@ func (c *httpServer) redirectToHTTPS() http.Handler {
 
 // newHTTP1And2Server initializes an HTTP server for HTTP/1.1 and HTTP/2 protocols.
 // It configures the server with the provided router and timeout settings.
-func (c *httpServer) newHTTP1And2Server(router *chi.Mux) {
+func (c *Server) newHTTP1And2Server(router *chi.Mux) {
 	c.http1And2Server = &http.Server{
 		Addr:              net.JoinHostPort("", fmt.Sprintf("%d", c.config.Port)),
 		Handler:           router,
@@ -305,7 +305,7 @@ func (c *httpServer) newHTTP1And2Server(router *chi.Mux) {
 // newHTTP3Server initializes an HTTP/3 server with optimized QUIC configuration.
 // It sets up connection limits, performance parameters, and security settings
 // for optimal HTTP/3 operation.
-func (c *httpServer) newHTTP3Server(router *chi.Mux) {
+func (c *Server) newHTTP3Server(router *chi.Mux) {
 	c.http3Server = &http3.Server{
 		Handler: router,
 		QUICConfig: &quic.Config{
