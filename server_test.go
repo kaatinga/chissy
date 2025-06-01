@@ -30,20 +30,20 @@ func TestServer_newHTTP1And2Server(t *testing.T) {
 
 		server.newHTTP1And2Server(router)
 
-		httpServer := server.http1And2Server
-		if !strings.Contains(httpServer.Addr, fmt.Sprintf(":%d", validConfig.Port)) {
+		srv := server.http1And2Server
+		if !strings.Contains(srv.Addr, fmt.Sprintf(":%d", validConfig.Port)) {
 			t.Error("incorrect http port")
 		}
 
-		if httpServer.ReadTimeout != validConfig.ReadTimeout {
+		if srv.ReadTimeout != validConfig.ReadTimeout {
 			t.Error("invalid read timeout")
 		}
 
-		if httpServer.WriteTimeout != validConfig.WriteTimeout {
+		if srv.WriteTimeout != validConfig.WriteTimeout {
 			t.Error("invalid write timeout")
 		}
 
-		if httpServer.ReadHeaderTimeout != validConfig.ReadHeaderTimeout {
+		if srv.ReadHeaderTimeout != validConfig.ReadHeaderTimeout {
 			t.Error("invalid read header timeout")
 		}
 	})
@@ -88,61 +88,36 @@ func TestServer_getDomainsPlusWWWDomains(t *testing.T) {
 }
 
 func TestServer_Launch(t *testing.T) {
-	tests := []struct {
-		name          string
-		config        Config
-		setupHandlers SetUpHandlers
-		ctx           context.Context
-		expectedError bool
-	}{
-		{
-			name:   "development mode",
-			config: validConfig,
-			setupHandlers: func(r *chi.Mux) {
-				r.Get("/test", func(w http.ResponseWriter, r *http.Request) {
+	t.Run("valid config", func(t *testing.T) {
+		ctx := context.Background()
+		server := NewServer(ctx, validConfig)
+
+		// Start server in a goroutine
+		go func() {
+			err := server.Launch(func(r *chi.Mux) {
+				r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 					w.WriteHeader(http.StatusOK)
 				})
-			},
-			ctx:           context.Background(),
-			expectedError: true, // Expect error due to context timeout
-		},
-		{
-			name: "production mode with SSL",
-			config: Config{
-				ProductionMode: true,
-				Port:           8089,
-				SSL: SSL{
-					Email:      "test@example.com",
-					DomainList: []string{"example.com"},
-				},
-				ReadTimeout:       1 * time.Minute,
-				ReadHeaderTimeout: 15 * time.Second,
-				WriteTimeout:      1 * time.Minute,
-			},
-			setupHandlers: func(r *chi.Mux) {
-				r.Get("/test", func(w http.ResponseWriter, r *http.Request) {
-					w.WriteHeader(http.StatusOK)
-				})
-			},
-			ctx:           context.Background(),
-			expectedError: true, // Expect error due to context timeout
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			server := NewServer(tt.ctx, tt.config)
-
-			// Create a context that will be cancelled after a short delay
-			ctx, cancel := context.WithTimeout(tt.ctx, 100*time.Millisecond)
-			defer cancel()
-
-			err := server.Launch(ctx, tt.setupHandlers)
-			if (err != nil) != tt.expectedError {
-				t.Errorf("Launch() error = %v, expectedError %v", err, tt.expectedError)
+			})
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
 			}
-		})
-	}
+		}()
+
+		// Give server time to start
+		time.Sleep(100 * time.Millisecond)
+
+		// Test HTTP endpoint
+		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/", validConfig.Port))
+		if err != nil {
+			t.Fatalf("failed to make request: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status OK, got %v", resp.Status)
+		}
+	})
 }
 
 func TestServer_newHTTP3Server(t *testing.T) {
@@ -163,6 +138,33 @@ func TestServer_newHTTP3Server(t *testing.T) {
 
 		if server.http3Server.QUICConfig == nil {
 			t.Error("QUIC config was not initialized")
+		}
+
+		// Check QUIC configuration
+		config := server.http3Server.QUICConfig
+		if config.MaxIncomingStreams != 1000 {
+			t.Errorf("expected MaxIncomingStreams to be 1000, got %d", config.MaxIncomingStreams)
+		}
+		if config.MaxIncomingUniStreams != 1000 {
+			t.Errorf("expected MaxIncomingUniStreams to be 1000, got %d", config.MaxIncomingUniStreams)
+		}
+		if config.MaxConnectionReceiveWindow != 15*1024*1024 {
+			t.Errorf("expected MaxConnectionReceiveWindow to be 15MB, got %d", config.MaxConnectionReceiveWindow)
+		}
+		if config.MaxStreamReceiveWindow != 6*1024*1024 {
+			t.Errorf("expected MaxStreamReceiveWindow to be 6MB, got %d", config.MaxStreamReceiveWindow)
+		}
+		if config.InitialStreamReceiveWindow != 512*1024 {
+			t.Errorf("expected InitialStreamReceiveWindow to be 512KB, got %d", config.InitialStreamReceiveWindow)
+		}
+		if config.MaxIdleTimeout != 30*time.Second {
+			t.Errorf("expected MaxIdleTimeout to be 30s, got %v", config.MaxIdleTimeout)
+		}
+		if config.HandshakeIdleTimeout != 10*time.Second {
+			t.Errorf("expected HandshakeIdleTimeout to be 10s, got %v", config.HandshakeIdleTimeout)
+		}
+		if config.DisablePathMTUDiscovery {
+			t.Error("expected DisablePathMTUDiscovery to be false")
 		}
 	})
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/acme/autocert"
@@ -23,11 +24,13 @@ const (
 	nextProtoH2     = "h2"
 )
 
-// SetUpHandlers type to announce handlers.
+// SetUpHandlers is a function type that defines how to configure HTTP routes and middleware
+// for the server. It receives a chi.Mux router instance to set up the routing configuration.
 type SetUpHandlers func(r *chi.Mux)
 
-// Config - http service configuration compatible to settings package.
-// https://github.com/kaatinga/settings
+// Config represents the HTTP server configuration settings.
+// It supports both production and development environments with SSL configuration.
+// All fields can be configured through environment variables.
 type Config struct {
 	ProductionMode    bool          `env:"PROD"`
 	LocalhostDomain   string        `env:"LOCALHOST_DOMAIN" validate:"required_if=ProductionMode false"`
@@ -38,28 +41,63 @@ type Config struct {
 	WriteTimeout      time.Duration `env:"WRITE_TIMEOUT" default:"1m"`
 }
 
+// SSL contains the configuration for SSL/TLS certificates.
+// It supports automatic certificate management through Let's Encrypt.
 type SSL struct {
 	Email      string `env:"EMAIL" validate:"email"`
 	DomainList []string
 }
 
-func NewServer(initCtx context.Context, config Config) *Server {
-	return &Server{
-		config: config,
-		ctx:    initCtx,
+// ServerOption defines a function that configures a server instance.
+// It follows the functional options pattern for flexible server configuration.
+type ServerOption func(*httpServer)
+
+// WithMetricsServer enables Prometheus metrics server on the specified port.
+// This allows monitoring of server metrics through the /metrics endpoint.
+func WithMetricsServer(port uint16) ServerOption {
+	return func(s *httpServer) {
+		s.metricsEnabled = true
+		s.metricsPort = port
 	}
 }
 
-type Server struct {
-	http1And2Server *http.Server
-	http3Server     *http3.Server
-	config          Config
-	ctx             context.Context
+// WithHTTP3 enables HTTP/3 support for the server.
+// HTTP/3 provides improved performance and reliability over HTTP/2.
+func WithHTTP3() ServerOption {
+	return func(s *httpServer) {
+		s.http3Enabled = true
+	}
 }
 
-// Launch enables the configured web server with the handlers that
-// announced in a function matched with SetUpHandlers type.
-func (c *Server) Launch(setupHandlers SetUpHandlers) error {
+// NewServer creates a new HTTP server instance with the given configuration and options.
+// It initializes the server with default settings and applies any provided options.
+func NewServer(ctx context.Context, config Config, opts ...ServerOption) *httpServer {
+	s := &httpServer{
+		ctx:    ctx,
+		config: config,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+type httpServer struct {
+	http1And2Server *http.Server
+	http3Server     *http3.Server
+	metricsServer   *http.Server
+	config          Config
+	ctx             context.Context
+	metricsEnabled  bool
+	metricsPort     uint16
+	http3Enabled    bool
+}
+
+// Launch starts the HTTP server with the provided route handlers.
+// It supports both HTTP/1.1, HTTP/2, and optionally HTTP/3 protocols.
+// In production mode, it also sets up SSL/TLS with automatic certificate management.
+// Returns an error if the server fails to start or encounters a fatal error.
+func (c *httpServer) Launch(setupHandlers SetUpHandlers) error {
 	domainsPlusWWWDomains := c.getDomainsPlusWWWDomains()
 
 	router := chi.NewRouter()
@@ -70,10 +108,9 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 	setupHandlers(router)
 
 	c.newHTTP1And2Server(router)
-	c.newHTTP3Server(router)
 
 	// Create a channel for server errors
-	serverErrors := make(chan error, 2) // Buffer size 2 for both servers
+	serverErrors := make(chan error, 3) // Buffer size 3 for HTTP1/2, HTTP3, and metrics servers
 
 	// Start the servers based on the mode
 	if c.config.ProductionMode {
@@ -89,11 +126,6 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 		tlsConfig1and2.GetCertificate = certManager.GetCertificate
 		tlsConfig1and2.NextProtos = []string{nextProtoH2}
 
-		tlsConfig3 := certManager.TLSConfig()
-		tlsConfig3.MinVersion = tls.VersionTLS13
-		tlsConfig3.GetCertificate = certManager.GetCertificate
-		tlsConfig3.NextProtos = []string{nextProtoH3, nextProtoH3_29}
-
 		// HTTP redirect server (non-critical)
 		go func() {
 			redirectServer := &http.Server{
@@ -105,6 +137,26 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 			_ = redirectServer.ListenAndServe()
 		}()
 
+		// Start metrics server if enabled
+		if c.metricsEnabled {
+			metricsMux := http.NewServeMux()
+			metricsMux.Handle("/metrics", promhttp.Handler())
+
+			c.metricsServer = &http.Server{
+				Addr:              net.JoinHostPort("", fmt.Sprintf("%d", c.metricsPort)),
+				Handler:           metricsMux,
+				ReadTimeout:       c.config.ReadTimeout,
+				ReadHeaderTimeout: c.config.ReadHeaderTimeout,
+				WriteTimeout:      c.config.WriteTimeout,
+			}
+
+			go func() {
+				if err := c.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					serverErrors <- fmt.Errorf("metrics server failed: %w", err)
+				}
+			}()
+		}
+
 		// HTTP 1.1 and HTTP/2 server
 		go func() {
 			c.http1And2Server.TLSConfig = tlsConfig1and2
@@ -112,12 +164,21 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 			serverErrors <- fmt.Errorf("HTTP1/2 server failed: %w", err)
 		}()
 
-		// HTTP/3 server
-		go func() {
-			c.http3Server.TLSConfig = tlsConfig3
-			err := c.http3Server.ListenAndServe()
-			serverErrors <- fmt.Errorf("HTTP3 server failed: %w", err)
-		}()
+		// HTTP/3 server if enabled
+		if c.http3Enabled {
+			c.newHTTP3Server(router)
+
+			tlsConfig3 := certManager.TLSConfig()
+			tlsConfig3.MinVersion = tls.VersionTLS13
+			tlsConfig3.GetCertificate = certManager.GetCertificate
+			tlsConfig3.NextProtos = []string{nextProtoH3, nextProtoH3_29}
+
+			go func() {
+				c.http3Server.TLSConfig = tlsConfig3
+				err := c.http3Server.ListenAndServe()
+				serverErrors <- fmt.Errorf("HTTP3 server failed: %w", err)
+			}()
+		}
 	} else {
 		go func() {
 			err := c.http1And2Server.ListenAndServe()
@@ -156,8 +217,8 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 		return nil
 	})
 
-	// Gracefully shutdown HTTP3 server if in production mode
-	if c.config.ProductionMode {
+	// Gracefully shutdown HTTP3 server if enabled
+	if c.http3Enabled {
 		g.Go(func() error {
 			err := c.http3Server.Shutdown(gCtx)
 			if err != nil {
@@ -173,6 +234,23 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 		})
 	}
 
+	// Gracefully shutdown metrics server if enabled
+	if c.metricsEnabled {
+		g.Go(func() error {
+			err := c.metricsServer.Shutdown(gCtx)
+			if err != nil {
+				// If graceful shutdown fails, force close
+				closeErr := c.metricsServer.Close()
+				if closeErr != nil {
+					return fmt.Errorf("failed graceful shutdown (%w) and force close (%v) of metrics server",
+						err, closeErr)
+				}
+				return fmt.Errorf("failed graceful shutdown of metrics server: %w", err)
+			}
+			return nil
+		})
+	}
+
 	// Wait for all shutdowns to complete
 	if err := g.Wait(); err != nil {
 		// If there was an error during shutdown, combine it with the original error
@@ -182,7 +260,9 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 	return shutdownErr
 }
 
-func (c *Server) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
+// getDomainsPlusWWWDomains generates a list of domains including their www subdomains
+// for SSL certificate management. This ensures both apex and www domains are covered.
+func (c *httpServer) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
 	domainsWithWWW = make([]string, len(c.config.SSL.DomainList)*2)
 	for i := range c.config.SSL.DomainList {
 		c.config.SSL.DomainList[i] = strings.TrimSpace(c.config.SSL.DomainList[i])
@@ -193,7 +273,9 @@ func (c *Server) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
 	return domainsWithWWW
 }
 
-func (c *Server) redirectToHTTPS() http.Handler {
+// redirectToHTTPS creates an HTTP handler that redirects all HTTP traffic to HTTPS.
+// It preserves the original request path and query parameters during redirection.
+func (c *httpServer) redirectToHTTPS() http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
 		// redirect to https
 		var domainToRedirect string
@@ -208,8 +290,9 @@ func (c *Server) redirectToHTTPS() http.Handler {
 	return http.HandlerFunc(fn)
 }
 
-// newHTTP1And2Server creates http.Server.
-func (c *Server) newHTTP1And2Server(router *chi.Mux) {
+// newHTTP1And2Server initializes an HTTP server for HTTP/1.1 and HTTP/2 protocols.
+// It configures the server with the provided router and timeout settings.
+func (c *httpServer) newHTTP1And2Server(router *chi.Mux) {
 	c.http1And2Server = &http.Server{
 		Addr:              net.JoinHostPort("", fmt.Sprintf("%d", c.config.Port)),
 		Handler:           router,
@@ -219,16 +302,26 @@ func (c *Server) newHTTP1And2Server(router *chi.Mux) {
 	}
 }
 
-// newHTTP3Server creates http.Server.
-func (c *Server) newHTTP3Server(router *chi.Mux) {
+// newHTTP3Server initializes an HTTP/3 server with optimized QUIC configuration.
+// It sets up connection limits, performance parameters, and security settings
+// for optimal HTTP/3 operation.
+func (c *httpServer) newHTTP3Server(router *chi.Mux) {
 	c.http3Server = &http3.Server{
-		Handler:    router,
+		Handler: router,
 		QUICConfig: &quic.Config{
-			// MaxIncomingStreams: 1,
+			// Connection limits
+			MaxIncomingStreams:    1000,
+			MaxIncomingUniStreams: 1000,
+
+			// Performance & resource management
+			MaxConnectionReceiveWindow: 15 * 1024 * 1024, // 15MB per connection
+			MaxStreamReceiveWindow:     6 * 1024 * 1024,  // 6MB per stream
+			InitialStreamReceiveWindow: 512 * 1024,       // 512KB initial window
+			MaxIdleTimeout:             30 * time.Second,
+			HandshakeIdleTimeout:       10 * time.Second,
+
+			// Security & stability
+			DisablePathMTUDiscovery: false,
 		},
-		// StreamHijacker: func(frameType http3.FrameType, conn quic.ConnectionTracingID, stream quic.Stream, err error) (bool, error) {
-		// 	// log.Println("stream frame type:", frameType)
-		// 	return false, nil
-		// },
 	}
 }
