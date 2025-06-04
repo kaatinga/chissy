@@ -220,6 +220,9 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 	// Gracefully shutdown HTTP3 server if enabled
 	if c.http3Enabled {
 		g.Go(func() error {
+			if c.http3Server == nil {
+				return nil
+			}
 			err := c.http3Server.Shutdown(gCtx)
 			if err != nil {
 				// If graceful shutdown fails, force close
@@ -237,6 +240,9 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 	// Gracefully shutdown metrics server if enabled
 	if c.metricsEnabled {
 		g.Go(func() error {
+			if c.metricsServer == nil {
+				return nil
+			}
 			err := c.metricsServer.Shutdown(gCtx)
 			if err != nil {
 				// If graceful shutdown fails, force close
