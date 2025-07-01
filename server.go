@@ -3,6 +3,7 @@ package chissy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	faststrconv "github.com/kaatinga/strconv"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -32,13 +34,13 @@ type SetUpHandlers func(r *chi.Mux)
 // It supports both production and development environments with SSL configuration.
 // All fields can be configured through environment variables.
 type Config struct {
-	ProductionMode    bool          `env:"PROD"`
 	LocalhostDomain   string        `env:"LOCALHOST_DOMAIN" validate:"required_if=ProductionMode false"`
 	SSL               SSL           `validate:"required_if=ProductionMode true"`
-	Port              uint16        `env:"PORT" validate:"min=80,max=65535"`
 	ReadTimeout       time.Duration `env:"READ_TIMEOUT" default:"1m"`
 	ReadHeaderTimeout time.Duration `env:"READ_HEADER_TIMEOUT" default:"15s"`
 	WriteTimeout      time.Duration `env:"WRITE_TIMEOUT" default:"1m"`
+	Port              uint16        `env:"PORT" validate:"min=80,max=65535"`
+	ProductionMode    bool          `env:"PROD"`
 }
 
 // SSL contains the configuration for SSL/TLS certificates.
@@ -83,13 +85,13 @@ func NewServer(ctx context.Context, config Config, opts ...ServerOption) *Server
 }
 
 type Server struct {
+	ctx             context.Context
 	http1And2Server *http.Server
 	http3Server     *http3.Server
 	metricsServer   *http.Server
 	config          Config
-	ctx             context.Context
-	metricsEnabled  bool
 	metricsPort     uint16
+	metricsEnabled  bool
 	http3Enabled    bool
 }
 
@@ -101,7 +103,7 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 	domainsPlusWWWDomains := c.getDomainsPlusWWWDomains()
 
 	router := chi.NewRouter()
-	if c.config.ProductionMode {
+	if c.config.ProductionMode && c.http3Enabled {
 		router.Use(advertiseHTTP3)
 		router.Use(advertiseHSTS)
 	}
@@ -124,7 +126,7 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 		tlsConfig1and2 := certManager.TLSConfig()
 		tlsConfig1and2.MinVersion = tls.VersionTLS13
 		tlsConfig1and2.GetCertificate = certManager.GetCertificate
-		tlsConfig1and2.NextProtos = []string{nextProtoH2}
+		tlsConfig1and2.NextProtos = []string{nextProtoH2, "http/1.1"}
 
 		// HTTP redirect server (non-critical)
 		go func() {
@@ -143,7 +145,7 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 			metricsMux.Handle("/metrics", promhttp.Handler())
 
 			c.metricsServer = &http.Server{
-				Addr:              net.JoinHostPort("", fmt.Sprintf("%d", c.metricsPort)),
+				Addr:              net.JoinHostPort("", faststrconv.Uint162String(c.metricsPort)),
 				Handler:           metricsMux,
 				ReadTimeout:       c.config.ReadTimeout,
 				ReadHeaderTimeout: c.config.ReadHeaderTimeout,
@@ -151,7 +153,7 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 			}
 
 			go func() {
-				if err := c.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				if err := c.metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 					serverErrors <- fmt.Errorf("metrics server failed: %w", err)
 				}
 			}()
@@ -300,7 +302,7 @@ func (c *Server) redirectToHTTPS() http.Handler {
 // It configures the server with the provided router and timeout settings.
 func (c *Server) newHTTP1And2Server(router *chi.Mux) {
 	c.http1And2Server = &http.Server{
-		Addr:              net.JoinHostPort("", fmt.Sprintf("%d", c.config.Port)),
+		Addr:              net.JoinHostPort("", faststrconv.Uint162String(c.config.Port)),
 		Handler:           router,
 		ReadTimeout:       c.config.ReadTimeout,
 		ReadHeaderTimeout: c.config.ReadHeaderTimeout,
