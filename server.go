@@ -71,12 +71,19 @@ func WithHTTP3() ServerOption {
 	}
 }
 
+func WithTLS12() ServerOption {
+	return func(s *Server) {
+		s.minTLSVersion = tls.VersionTLS12
+	}
+}
+
 // NewServer creates a new HTTP server instance with the given configuration and options.
 // It initializes the server with default settings and applies any provided options.
 func NewServer(ctx context.Context, config Config, opts ...ServerOption) *Server {
 	s := &Server{
-		ctx:    ctx,
-		config: config,
+		ctx:           ctx,
+		config:        config,
+		minTLSVersion: tls.VersionTLS13,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -93,38 +100,39 @@ type Server struct {
 	metricsPort     uint16
 	metricsEnabled  bool
 	http3Enabled    bool
+	minTLSVersion   uint16 // minTLSVersion specifies the minimum supported TLS version for secure connections in the http/1.1 and http2 server.
 }
 
 // Launch starts the HTTP server with the provided route handlers.
 // It supports both HTTP/1.1, HTTP/2, and optionally HTTP/3 protocols.
 // In production mode, it also sets up SSL/TLS with automatic certificate management.
 // Returns an error if the server fails to start or encounters a fatal error.
-func (c *Server) Launch(setupHandlers SetUpHandlers) error {
-	domainsPlusWWWDomains := c.getDomainsPlusWWWDomains()
+func (s *Server) Launch(setupHandlers SetUpHandlers) error {
+	domainsPlusWWWDomains := s.getDomainsPlusWWWDomains()
 
 	router := chi.NewRouter()
-	if c.config.ProductionMode && c.http3Enabled {
+	if s.config.ProductionMode && s.http3Enabled {
 		router.Use(advertiseHTTP3)
 		router.Use(advertiseHSTS)
 	}
 	setupHandlers(router)
 
-	c.newHTTP1And2Server(router)
+	s.newHTTP1And2Server(router)
 
 	// Create a channel for server errors
 	serverErrors := make(chan error, 3) // Buffer size 3 for HTTP1/2, HTTP3, and metrics servers
 
 	// Start the servers based on the mode
-	if c.config.ProductionMode {
+	if s.config.ProductionMode {
 		certManager := autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(domainsPlusWWWDomains...),
 			Cache:      autocert.DirCache("certs"),
-			Email:      c.config.SSL.Email,
+			Email:      s.config.SSL.Email,
 		}
 
 		tlsConfig1and2 := certManager.TLSConfig()
-		tlsConfig1and2.MinVersion = tls.VersionTLS13
+		tlsConfig1and2.MinVersion = s.minTLSVersion
 		tlsConfig1and2.GetCertificate = certManager.GetCertificate
 		tlsConfig1and2.NextProtos = []string{nextProtoH2, "http/1.1"}
 
@@ -132,7 +140,7 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 		go func() {
 			redirectServer := &http.Server{
 				Addr:    ":http",
-				Handler: certManager.HTTPHandler(c.redirectToHTTPS()),
+				Handler: certManager.HTTPHandler(s.redirectToHTTPS()),
 			}
 
 			// Start the server, but don't report errors as critical
@@ -140,20 +148,20 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 		}()
 
 		// Start metrics server if enabled
-		if c.metricsEnabled {
+		if s.metricsEnabled {
 			metricsMux := http.NewServeMux()
 			metricsMux.Handle("/metrics", promhttp.Handler())
 
-			c.metricsServer = &http.Server{
-				Addr:              net.JoinHostPort("", faststrconv.Uint162String(c.metricsPort)),
+			s.metricsServer = &http.Server{
+				Addr:              net.JoinHostPort("", faststrconv.Uint162String(s.metricsPort)),
 				Handler:           metricsMux,
-				ReadTimeout:       c.config.ReadTimeout,
-				ReadHeaderTimeout: c.config.ReadHeaderTimeout,
-				WriteTimeout:      c.config.WriteTimeout,
+				ReadTimeout:       s.config.ReadTimeout,
+				ReadHeaderTimeout: s.config.ReadHeaderTimeout,
+				WriteTimeout:      s.config.WriteTimeout,
 			}
 
 			go func() {
-				if err := c.metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				if err := s.metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 					serverErrors <- fmt.Errorf("metrics server failed: %w", err)
 				}
 			}()
@@ -161,14 +169,14 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 
 		// HTTP 1.1 and HTTP/2 server
 		go func() {
-			c.http1And2Server.TLSConfig = tlsConfig1and2
-			err := c.http1And2Server.ListenAndServeTLS("", "")
+			s.http1And2Server.TLSConfig = tlsConfig1and2
+			err := s.http1And2Server.ListenAndServeTLS("", "")
 			serverErrors <- fmt.Errorf("HTTP1/2 server failed: %w", err)
 		}()
 
 		// HTTP/3 server if enabled
-		if c.http3Enabled {
-			c.newHTTP3Server(router)
+		if s.http3Enabled {
+			s.newHTTP3Server(router)
 
 			tlsConfig3 := certManager.TLSConfig()
 			tlsConfig3.MinVersion = tls.VersionTLS13
@@ -176,14 +184,14 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 			tlsConfig3.NextProtos = []string{nextProtoH3, nextProtoH3_29}
 
 			go func() {
-				c.http3Server.TLSConfig = tlsConfig3
-				err := c.http3Server.ListenAndServe()
+				s.http3Server.TLSConfig = tlsConfig3
+				err := s.http3Server.ListenAndServe()
 				serverErrors <- fmt.Errorf("HTTP3 server failed: %w", err)
 			}()
 		}
 	} else {
 		go func() {
-			err := c.http1And2Server.ListenAndServe()
+			err := s.http1And2Server.ListenAndServe()
 			serverErrors <- fmt.Errorf("HTTP server failed: %w", err)
 		}()
 	}
@@ -193,8 +201,8 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 	select {
 	case err := <-serverErrors:
 		shutdownErr = err
-	case <-c.ctx.Done():
-		shutdownErr = c.ctx.Err()
+	case <-s.ctx.Done():
+		shutdownErr = s.ctx.Err()
 	}
 
 	// Create a timeout context for shutdown
@@ -206,10 +214,10 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 
 	// Gracefully shutdown HTTP1/2 server
 	g.Go(func() error {
-		err := c.http1And2Server.Shutdown(gCtx)
+		err := s.http1And2Server.Shutdown(gCtx)
 		if err != nil {
 			// If graceful shutdown fails, force close
-			closeErr := c.http1And2Server.Close()
+			closeErr := s.http1And2Server.Close()
 			if closeErr != nil {
 				return fmt.Errorf("failed graceful shutdown (%w) and force close (%v) of HTTP1/2 server",
 					err, closeErr)
@@ -220,15 +228,15 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 	})
 
 	// Gracefully shutdown HTTP3 server if enabled
-	if c.http3Enabled {
+	if s.http3Enabled {
 		g.Go(func() error {
-			if c.http3Server == nil {
+			if s.http3Server == nil {
 				return nil
 			}
-			err := c.http3Server.Shutdown(gCtx)
+			err := s.http3Server.Shutdown(gCtx)
 			if err != nil {
 				// If graceful shutdown fails, force close
-				closeErr := c.http3Server.Close()
+				closeErr := s.http3Server.Close()
 				if closeErr != nil {
 					return fmt.Errorf("failed graceful shutdown (%w) and force close (%v) of HTTP3 server",
 						err, closeErr)
@@ -240,15 +248,15 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 	}
 
 	// Gracefully shutdown metrics server if enabled
-	if c.metricsEnabled {
+	if s.metricsEnabled {
 		g.Go(func() error {
-			if c.metricsServer == nil {
+			if s.metricsServer == nil {
 				return nil
 			}
-			err := c.metricsServer.Shutdown(gCtx)
+			err := s.metricsServer.Shutdown(gCtx)
 			if err != nil {
 				// If graceful shutdown fails, force close
-				closeErr := c.metricsServer.Close()
+				closeErr := s.metricsServer.Close()
 				if closeErr != nil {
 					return fmt.Errorf("failed graceful shutdown (%w) and force close (%v) of metrics server",
 						err, closeErr)
@@ -270,12 +278,12 @@ func (c *Server) Launch(setupHandlers SetUpHandlers) error {
 
 // getDomainsPlusWWWDomains generates a list of domains including their www subdomains
 // for SSL certificate management. This ensures both apex and www domains are covered.
-func (c *Server) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
-	domainsWithWWW = make([]string, len(c.config.SSL.DomainList)*2)
-	for i := range c.config.SSL.DomainList {
-		c.config.SSL.DomainList[i] = strings.TrimSpace(c.config.SSL.DomainList[i])
-		domainsWithWWW[i*2] = c.config.SSL.DomainList[i]
-		domainsWithWWW[i*2+1] = "www." + c.config.SSL.DomainList[i]
+func (s *Server) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
+	domainsWithWWW = make([]string, len(s.config.SSL.DomainList)*2)
+	for i := range s.config.SSL.DomainList {
+		s.config.SSL.DomainList[i] = strings.TrimSpace(s.config.SSL.DomainList[i])
+		domainsWithWWW[i*2] = s.config.SSL.DomainList[i]
+		domainsWithWWW[i*2+1] = "www." + s.config.SSL.DomainList[i]
 	}
 
 	return domainsWithWWW
@@ -283,11 +291,11 @@ func (c *Server) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
 
 // redirectToHTTPS creates an HTTP handler that redirects all HTTP traffic to HTTPS.
 // It preserves the original request path and query parameters during redirection.
-func (c *Server) redirectToHTTPS() http.Handler {
+func (s *Server) redirectToHTTPS() http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
 		// redirect to https
 		var domainToRedirect string
-		for _, domain := range c.config.SSL.DomainList {
+		for _, domain := range s.config.SSL.DomainList {
 			if strings.Contains(r.Host, domain) {
 				domainToRedirect = domain
 			}
@@ -300,21 +308,21 @@ func (c *Server) redirectToHTTPS() http.Handler {
 
 // newHTTP1And2Server initializes an HTTP server for HTTP/1.1 and HTTP/2 protocols.
 // It configures the server with the provided router and timeout settings.
-func (c *Server) newHTTP1And2Server(router *chi.Mux) {
-	c.http1And2Server = &http.Server{
-		Addr:              net.JoinHostPort("", faststrconv.Uint162String(c.config.Port)),
+func (s *Server) newHTTP1And2Server(router *chi.Mux) {
+	s.http1And2Server = &http.Server{
+		Addr:              net.JoinHostPort("", faststrconv.Uint162String(s.config.Port)),
 		Handler:           router,
-		ReadTimeout:       c.config.ReadTimeout,
-		ReadHeaderTimeout: c.config.ReadHeaderTimeout,
-		WriteTimeout:      c.config.WriteTimeout,
+		ReadTimeout:       s.config.ReadTimeout,
+		ReadHeaderTimeout: s.config.ReadHeaderTimeout,
+		WriteTimeout:      s.config.WriteTimeout,
 	}
 }
 
 // newHTTP3Server initializes an HTTP/3 server with optimized QUIC configuration.
 // It sets up connection limits, performance parameters, and security settings
 // for optimal HTTP/3 operation.
-func (c *Server) newHTTP3Server(router *chi.Mux) {
-	c.http3Server = &http3.Server{
+func (s *Server) newHTTP3Server(router *chi.Mux) {
+	s.http3Server = &http3.Server{
 		Handler: router,
 		QUICConfig: &quic.Config{
 			// Connection limits
