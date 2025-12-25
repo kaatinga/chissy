@@ -6,7 +6,7 @@ require (
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/kaatinga/strconv v1.3.0
 	github.com/prometheus/client_golang v1.23.2
-	github.com/quic-go/quic-go v0.57.1
+	github.com/quic-go/quic-go v0.58.0
 	golang.org/x/crypto v0.46.0
 	golang.org/x/sync v0.19.0
 )
