@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -315,6 +316,7 @@ func (s *Server) newHTTP1And2Server(router *chi.Mux) {
 		ReadTimeout:       s.config.ReadTimeout,
 		ReadHeaderTimeout: s.config.ReadHeaderTimeout,
 		WriteTimeout:      s.config.WriteTimeout,
+		ErrorLog:          log.New(newFilteringWriter(), "", 0),
 	}
 }
 
