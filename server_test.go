@@ -2,7 +2,9 @@ package chissy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -11,6 +13,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 var (
@@ -89,35 +93,105 @@ func TestServer_getDomainsPlusWWWDomains(t *testing.T) {
 
 func TestServer_Launch(t *testing.T) {
 	t.Run("valid config", func(t *testing.T) {
-		ctx := context.Background()
-		server := NewServer(ctx, validConfig)
+		config := validConfig
+		config.Port = freeTCPPort(t)
 
-		// Start server in a goroutine
+		ctx, cancel := context.WithCancel(context.Background())
+		server := NewServer(ctx, config)
+		launchDone := make(chan error, 1)
+
 		go func() {
-			err := server.Launch(func(r *chi.Mux) {
+			launchDone <- server.Launch(func(r *chi.Mux) {
 				r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 					w.WriteHeader(http.StatusOK)
 				})
 			})
-			if err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
 		}()
 
-		// Give server time to start
-		time.Sleep(100 * time.Millisecond)
-
-		// Test HTTP endpoint
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/", validConfig.Port))
-		if err != nil {
-			t.Fatalf("failed to make request: %v", err)
-		}
-		defer resp.Body.Close()
+		resp := waitForHTTPResponse(t, fmt.Sprintf("http://localhost:%d/", config.Port))
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("expected status OK, got %v", resp.Status)
 		}
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("failed to close response body: %v", err)
+		}
+
+		cancel()
+		select {
+		case err := <-launchDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("Launch() error = %v, want context.Canceled", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Launch() did not return after context cancellation")
+		}
 	})
+}
+
+func TestServer_newHTTP1And2TLSConfig(t *testing.T) {
+	server := NewServer(context.Background(), validConfig)
+	certManager := &autocert.Manager{}
+
+	tlsConfig := server.newHTTP1And2TLSConfig(certManager)
+
+	if tlsConfig.MinVersion != server.minTLSVersion {
+		t.Errorf("MinVersion = %d, want %d", tlsConfig.MinVersion, server.minTLSVersion)
+	}
+	for _, protocol := range []string{nextProtoH2, "http/1.1", acme.ALPNProto} {
+		if !containsString(tlsConfig.NextProtos, protocol) {
+			t.Errorf("NextProtos = %v, want protocol %q", tlsConfig.NextProtos, protocol)
+		}
+	}
+}
+
+func TestServer_newRouterProductionHeaders(t *testing.T) {
+	tests := []struct {
+		name            string
+		productionMode  bool
+		http3Enabled    bool
+		wantHSTS        bool
+		wantHTTP3Header bool
+	}{
+		{
+			name:           "production without HTTP3",
+			productionMode: true,
+			wantHSTS:       true,
+		},
+		{
+			name:            "production with HTTP3",
+			productionMode:  true,
+			http3Enabled:    true,
+			wantHSTS:        true,
+			wantHTTP3Header: true,
+		},
+		{
+			name: "local HTTP",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := NewServer(context.Background(), Config{ProductionMode: tt.productionMode})
+			server.http3Enabled = tt.http3Enabled
+			router := server.newRouter(func(r *chi.Mux) {
+				r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusNoContent)
+				})
+			})
+
+			req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if got := rec.Header().Get("Strict-Transport-Security"); (got != "") != tt.wantHSTS {
+				t.Errorf("Strict-Transport-Security = %q, want header present = %t", got, tt.wantHSTS)
+			}
+			if got := rec.Header().Get("Alt-Svc"); (got != "") != tt.wantHTTP3Header {
+				t.Errorf("Alt-Svc = %q, want header present = %t", got, tt.wantHTTP3Header)
+			}
+		})
+	}
 }
 
 func TestServer_newHTTP3Server(t *testing.T) {
@@ -169,95 +243,176 @@ func TestServer_newHTTP3Server(t *testing.T) {
 	})
 }
 
-func TestServer_Shutdown(t *testing.T) {
-	t.Run("graceful shutdown", func(t *testing.T) {
-		ctx := context.Background()
-		server := NewServer(ctx, validConfig)
-		router := chi.NewRouter()
+func TestServer_shutdownClosesRedirectServer(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	listenerAddress := listener.Addr().String()
 
-		// Initialize servers
-		server.newHTTP1And2Server(router)
-		server.newHTTP3Server(router)
+	redirectServer := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	server := NewServer(context.Background(), validConfig)
+	server.httpRedirectServer = redirectServer
 
-		// Create a context that will be cancelled immediately
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), timeOutDuration)
-		defer cancel()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- redirectServer.Serve(listener)
+	}()
 
-		// Start server in a goroutine
-		go func() {
-			_ = server.http1And2Server.ListenAndServe()
-		}()
+	resp := waitForHTTPResponse(t, "http://"+listenerAddress)
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("failed to close response body: %v", err)
+	}
 
-		// Give the server a moment to start
-		time.Sleep(10 * time.Millisecond)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeOutDuration)
+	defer cancel()
+	if err := server.shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown() error = %v", err)
+	}
 
-		// Attempt shutdown
-		err := server.http1And2Server.Shutdown(shutdownCtx)
-		if err != nil {
-			t.Errorf("Shutdown() error = %v", err)
+	select {
+	case err := <-serveDone:
+		if !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("Serve() error = %v, want http.ErrServerClosed", err)
 		}
-	})
+	case <-time.After(time.Second):
+		t.Fatal("redirect server did not stop")
+	}
+
+	reopenedListener, err := net.Listen("tcp", listenerAddress)
+	if err != nil {
+		t.Fatalf("redirect listener address was not released: %v", err)
+	}
+	if err := reopenedListener.Close(); err != nil {
+		t.Errorf("failed to close reopened listener: %v", err)
+	}
 }
 
 func TestServer_redirectToHTTPS(t *testing.T) {
 	tests := []struct {
-		name           string
-		config         Config
-		requestHost    string
-		expectedDomain string
+		name         string
+		requestHost  string
+		wantStatus   int
+		wantLocation string
 	}{
 		{
-			name: "single domain match",
-			config: Config{
-				SSL: SSL{
-					DomainList: []string{"example.com"},
-				},
-			},
-			requestHost:    "example.com",
-			expectedDomain: "example.com",
+			name:         "apex domain",
+			requestHost:  "example.com",
+			wantStatus:   http.StatusPermanentRedirect,
+			wantLocation: "https://example.com/path?key=value",
 		},
 		{
-			name: "www subdomain match",
-			config: Config{
-				SSL: SSL{
-					DomainList: []string{"example.com"},
-				},
-			},
-			requestHost:    "www.example.com",
-			expectedDomain: "example.com",
+			name:         "www uses apex domain",
+			requestHost:  "www.example.com",
+			wantStatus:   http.StatusPermanentRedirect,
+			wantLocation: "https://example.com/path?key=value",
 		},
 		{
-			name: "multiple domains",
-			config: Config{
-				SSL: SSL{
-					DomainList: []string{"example.com", "test.com"},
-				},
-			},
-			requestHost:    "test.com",
-			expectedDomain: "test.com",
+			name:         "host with port",
+			requestHost:  "example.com:80",
+			wantStatus:   http.StatusPermanentRedirect,
+			wantLocation: "https://example.com/path?key=value",
+		},
+		{
+			name:         "case insensitive host with trailing dot",
+			requestHost:  "EXAMPLE.COM.:80",
+			wantStatus:   http.StatusPermanentRedirect,
+			wantLocation: "https://example.com/path?key=value",
+		},
+		{
+			name:         "second configured domain",
+			requestHost:  "test.com",
+			wantStatus:   http.StatusPermanentRedirect,
+			wantLocation: "https://test.com/path?key=value",
+		},
+		{
+			name:        "unknown domain",
+			requestHost: "unknown.example",
+			wantStatus:  http.StatusMisdirectedRequest,
+		},
+		{
+			name:        "substring domain",
+			requestHost: "notexample.com",
+			wantStatus:  http.StatusMisdirectedRequest,
+		},
+		{
+			name:        "invalid port",
+			requestHost: "example.com:http",
+			wantStatus:  http.StatusMisdirectedRequest,
+		},
+		{
+			name:        "malformed host",
+			requestHost: "example.com/path",
+			wantStatus:  http.StatusMisdirectedRequest,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
-			server := NewServer(ctx, tt.config)
+			server := NewServer(context.Background(), Config{
+				SSL: SSL{
+					DomainList: []string{"www.example.com", "example.com", "test.com"},
+				},
+			})
 			handler := server.redirectToHTTPS()
 
-			req := httptest.NewRequest("GET", "/path", nil)
+			req := httptest.NewRequest(http.MethodGet, "/path?key=value", nil)
 			req.Host = tt.requestHost
 			rec := httptest.NewRecorder()
 
 			handler.ServeHTTP(rec, req)
 
-			if rec.Code != http.StatusPermanentRedirect {
-				t.Errorf("expected status %d, got %d", http.StatusPermanentRedirect, rec.Code)
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
 			}
-
-			expectedLocation := "https://" + tt.expectedDomain + "/path"
-			if location := rec.Header().Get("Location"); location != expectedLocation {
-				t.Errorf("expected location %s, got %s", expectedLocation, location)
+			if location := rec.Header().Get("Location"); location != tt.wantLocation {
+				t.Errorf("Location = %q, want %q", location, tt.wantLocation)
 			}
 		})
 	}
+}
+
+func freeTCPPort(t *testing.T) uint16 {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate TCP port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("failed to release allocated TCP port: %v", err)
+	}
+
+	return uint16(port)
+}
+
+func waitForHTTPResponse(t *testing.T, url string) *http.Response {
+	t.Helper()
+
+	client := &http.Client{Timeout: 100 * time.Millisecond}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp, err := client.Get(url)
+		if err == nil {
+			return resp
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server at %s did not become ready: %v", url, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

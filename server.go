@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,15 +94,16 @@ func NewServer(ctx context.Context, config Config, opts ...ServerOption) *Server
 }
 
 type Server struct {
-	ctx             context.Context
-	http1And2Server *http.Server
-	http3Server     *http3.Server
-	metricsServer   *http.Server
-	config          Config
-	metricsPort     uint16
-	metricsEnabled  bool
-	http3Enabled    bool
-	minTLSVersion   uint16 // minTLSVersion specifies the minimum supported TLS version for secure connections in the http/1.1 and http2 server.
+	ctx                context.Context
+	http1And2Server    *http.Server
+	http3Server        *http3.Server
+	httpRedirectServer *http.Server
+	metricsServer      *http.Server
+	config             Config
+	metricsPort        uint16
+	metricsEnabled     bool
+	http3Enabled       bool
+	minTLSVersion      uint16 // minTLSVersion specifies the minimum supported TLS version for secure connections in the http/1.1 and http2 server.
 }
 
 // Launch starts the HTTP server with the provided route handlers.
@@ -111,17 +113,11 @@ type Server struct {
 func (s *Server) Launch(setupHandlers SetUpHandlers) error {
 	domainsPlusWWWDomains := s.getDomainsPlusWWWDomains()
 
-	router := chi.NewRouter()
-	if s.config.ProductionMode && s.http3Enabled {
-		router.Use(advertiseHTTP3)
-		router.Use(advertiseHSTS)
-	}
-	setupHandlers(router)
-
+	router := s.newRouter(setupHandlers)
 	s.newHTTP1And2Server(router)
 
 	// Create a channel for server errors
-	serverErrors := make(chan error, 3) // Buffer size 3 for HTTP1/2, HTTP3, and metrics servers
+	serverErrors := make(chan error, 4) // Buffer size 4 for HTTP1/2, HTTP3, redirect, and metrics servers
 
 	// Start the servers based on the mode
 	if s.config.ProductionMode {
@@ -132,20 +128,19 @@ func (s *Server) Launch(setupHandlers SetUpHandlers) error {
 			Email:      s.config.SSL.Email,
 		}
 
-		tlsConfig1and2 := certManager.TLSConfig()
-		tlsConfig1and2.MinVersion = s.minTLSVersion
-		tlsConfig1and2.GetCertificate = certManager.GetCertificate
-		tlsConfig1and2.NextProtos = []string{nextProtoH2, "http/1.1"}
+		tlsConfig1and2 := s.newHTTP1And2TLSConfig(&certManager)
 
-		// HTTP redirect server (non-critical)
+		s.httpRedirectServer = &http.Server{
+			Addr:              ":http",
+			Handler:           certManager.HTTPHandler(s.redirectToHTTPS()),
+			ReadTimeout:       s.config.ReadTimeout,
+			ReadHeaderTimeout: s.config.ReadHeaderTimeout,
+			WriteTimeout:      s.config.WriteTimeout,
+		}
 		go func() {
-			redirectServer := &http.Server{
-				Addr:    ":http",
-				Handler: certManager.HTTPHandler(s.redirectToHTTPS()),
+			if err := s.httpRedirectServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErrors <- fmt.Errorf("HTTP redirect server failed: %w", err)
 			}
-
-			// Start the server, but don't report errors as critical
-			_ = redirectServer.ListenAndServe()
 		}()
 
 		// Start metrics server if enabled
@@ -210,71 +205,87 @@ func (s *Server) Launch(setupHandlers SetUpHandlers) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeOutDuration)
 	defer cancel()
 
-	// Use errgroup to manage shutdown of multiple servers
-	g, gCtx := errgroup.WithContext(shutdownCtx)
-
-	// Gracefully shutdown HTTP1/2 server
-	g.Go(func() error {
-		err := s.http1And2Server.Shutdown(gCtx)
-		if err != nil {
-			// If graceful shutdown fails, force close
-			closeErr := s.http1And2Server.Close()
-			if closeErr != nil {
-				return fmt.Errorf("failed graceful shutdown (%w) and force close (%v) of HTTP1/2 server",
-					err, closeErr)
-			}
-			return fmt.Errorf("failed graceful shutdown of HTTP1/2 server: %w", err)
-		}
-		return nil
-	})
-
-	// Gracefully shutdown HTTP3 server if enabled
-	if s.http3Enabled {
-		g.Go(func() error {
-			if s.http3Server == nil {
-				return nil
-			}
-			err := s.http3Server.Shutdown(gCtx)
-			if err != nil {
-				// If graceful shutdown fails, force close
-				closeErr := s.http3Server.Close()
-				if closeErr != nil {
-					return fmt.Errorf("failed graceful shutdown (%w) and force close (%v) of HTTP3 server",
-						err, closeErr)
-				}
-				return fmt.Errorf("failed graceful shutdown of HTTP3 server: %w", err)
-			}
-			return nil
-		})
-	}
-
-	// Gracefully shutdown metrics server if enabled
-	if s.metricsEnabled {
-		g.Go(func() error {
-			if s.metricsServer == nil {
-				return nil
-			}
-			err := s.metricsServer.Shutdown(gCtx)
-			if err != nil {
-				// If graceful shutdown fails, force close
-				closeErr := s.metricsServer.Close()
-				if closeErr != nil {
-					return fmt.Errorf("failed graceful shutdown (%w) and force close (%v) of metrics server",
-						err, closeErr)
-				}
-				return fmt.Errorf("failed graceful shutdown of metrics server: %w", err)
-			}
-			return nil
-		})
-	}
-
 	// Wait for all shutdowns to complete
-	if err := g.Wait(); err != nil {
+	if err := s.shutdown(shutdownCtx); err != nil {
 		// If there was an error during shutdown, combine it with the original error
 		shutdownErr = fmt.Errorf("%v; additionally, shutdown error: %w", shutdownErr, err)
 	}
 
 	return shutdownErr
+}
+
+func (s *Server) newRouter(setupHandlers SetUpHandlers) *chi.Mux {
+	router := chi.NewRouter()
+	if s.config.ProductionMode {
+		router.Use(advertiseHSTS)
+		if s.http3Enabled {
+			router.Use(advertiseHTTP3)
+		}
+	}
+	setupHandlers(router)
+
+	return router
+}
+
+func (s *Server) newHTTP1And2TLSConfig(certManager *autocert.Manager) *tls.Config {
+	tlsConfig := certManager.TLSConfig()
+	tlsConfig.MinVersion = s.minTLSVersion
+
+	return tlsConfig
+}
+
+func (s *Server) shutdown(ctx context.Context) error {
+	g, gCtx := errgroup.WithContext(ctx)
+
+	if s.http1And2Server != nil {
+		g.Go(func() error {
+			return shutdownHTTPServer(gCtx, "HTTP1/2", s.http1And2Server)
+		})
+	}
+
+	if s.httpRedirectServer != nil {
+		g.Go(func() error {
+			return shutdownHTTPServer(gCtx, "HTTP redirect", s.httpRedirectServer)
+		})
+	}
+
+	if s.http3Server != nil {
+		g.Go(func() error {
+			err := s.http3Server.Shutdown(gCtx)
+			if err == nil {
+				return nil
+			}
+
+			closeErr := s.http3Server.Close()
+			if closeErr != nil {
+				return fmt.Errorf("failed graceful shutdown (%w) and force close (%v) of HTTP3 server",
+					err, closeErr)
+			}
+			return fmt.Errorf("failed graceful shutdown of HTTP3 server: %w", err)
+		})
+	}
+
+	if s.metricsServer != nil {
+		g.Go(func() error {
+			return shutdownHTTPServer(gCtx, "metrics", s.metricsServer)
+		})
+	}
+
+	return g.Wait()
+}
+
+func shutdownHTTPServer(ctx context.Context, name string, server *http.Server) error {
+	err := server.Shutdown(ctx)
+	if err == nil {
+		return nil
+	}
+
+	closeErr := server.Close()
+	if closeErr != nil {
+		return fmt.Errorf("failed graceful shutdown (%w) and force close (%v) of %s server",
+			err, closeErr, name)
+	}
+	return fmt.Errorf("failed graceful shutdown of %s server: %w", name, err)
 }
 
 // getDomainsPlusWWWDomains generates a list of domains including their www subdomains
@@ -294,17 +305,76 @@ func (s *Server) getDomainsPlusWWWDomains() (domainsWithWWW []string) {
 // It preserves the original request path and query parameters during redirection.
 func (s *Server) redirectToHTTPS() http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
-		// redirect to https
-		var domainToRedirect string
-		for _, domain := range s.config.SSL.DomainList {
-			if strings.Contains(r.Host, domain) {
-				domainToRedirect = domain
-			}
+		requestHost, ok := normalizeRequestHost(r.Host)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusMisdirectedRequest), http.StatusMisdirectedRequest)
+			return
 		}
+
+		domainToRedirect, ok := s.redirectDomain(requestHost)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusMisdirectedRequest), http.StatusMisdirectedRequest)
+			return
+		}
+
 		http.Redirect(w, r, "https://"+domainToRedirect+r.RequestURI, http.StatusPermanentRedirect)
 	}
 
 	return http.HandlerFunc(fn)
+}
+
+func normalizeRequestHost(hostPort string) (string, bool) {
+	if hostPort == "" || hostPort != strings.TrimSpace(hostPort) {
+		return "", false
+	}
+
+	host := hostPort
+	if strings.Contains(hostPort, ":") {
+		var port string
+		var err error
+		host, port, err = net.SplitHostPort(hostPort)
+		if err != nil || port == "" {
+			return "", false
+		}
+		if _, err = strconv.ParseUint(port, 10, 16); err != nil {
+			return "", false
+		}
+	}
+
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" || strings.ContainsAny(host, `/\`) {
+		return "", false
+	}
+
+	return host, true
+}
+
+func (s *Server) redirectDomain(requestHost string) (string, bool) {
+	domains := make([]string, 0, len(s.config.SSL.DomainList))
+	for _, configuredDomain := range s.config.SSL.DomainList {
+		domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(configuredDomain), "."))
+		if domain == "" || strings.ContainsAny(domain, `:/\`) {
+			continue
+		}
+		domains = append(domains, domain)
+	}
+
+	if strings.HasPrefix(requestHost, "www.") {
+		apexDomain := strings.TrimPrefix(requestHost, "www.")
+		for _, domain := range domains {
+			if domain == apexDomain {
+				return domain, true
+			}
+		}
+	}
+
+	for _, domain := range domains {
+		if requestHost == domain || requestHost == "www."+domain {
+			return domain, true
+		}
+	}
+
+	return "", false
 }
 
 // newHTTP1And2Server initializes an HTTP server for HTTP/1.1 and HTTP/2 protocols.
